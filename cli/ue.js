@@ -332,7 +332,8 @@ function resolveFlagMode(args) {
     ["settings-show", ["settings", "show"]],
     ["settings-set", ["settings", "set", ...args.positionals]],
     ["upstream-lookup", ["upstream", "lookup"]],
-    ["upstream-list", ["upstream", "list"]]
+    ["upstream-list", ["upstream", "list"]],
+    ["file", ["file", args.options.file].filter(Boolean)]
   ];
 
   for (const [flag, mapped] of flags) {
@@ -426,7 +427,8 @@ async function commandAssets(args) {
           const pct = String(p.percent).padStart(3, " ");
           const statusLine = `${bar} ${pct}% [${p.processed}/${p.total}]`;
 
-          process.stdout.write(`  ${tone("测活", ansi.bold, ansi.cyan)} ${statusLine}`);
+          process.stdout.write(`
+  ${tone("测活", ansi.bold, ansi.cyan)} ${statusLine}`);
 
           // 显示当前目标
           if (p.current) {
@@ -440,11 +442,14 @@ async function commandAssets(args) {
           }
 
           // 移动光标回去
-          process.stdout.write(`[1A`);
+          process.stdout.write(`
+[1A`);
         } else if (p.stage === "ai-classifying") {
-          process.stdout.write(`  ${tone("AI分类中...", ansi.bold, ansi.magenta)}`);
+          process.stdout.write(`
+  ${tone("AI分类中...", ansi.bold, ansi.magenta)}`);
         } else if (p.stage === "ai-classify-done") {
-          process.stdout.write(`  ${tone(`AI分类完成: ${p.classified}/${p.total}`, ansi.bold, ansi.green)}`);
+          process.stdout.write(`
+  ${tone(`AI分类完成: ${p.classified}/${p.total}`, ansi.bold, ansi.green)}`);
         }
       }
     });
@@ -799,6 +804,515 @@ async function commandScans(args) {
   fail("可用命令: ue scans list | run | clear-finished");
 }
 
+
+async function commandFile(args) {
+  const filePath = args.positionals[0] || args.options.file;
+  if (!filePath) {
+    fail("用法: ue --file targets.xlsx");
+  }
+
+  const absolutePath = ensureFile(filePath);
+  const ext = path.extname(absolutePath).toLowerCase();
+
+  if (![".xlsx", ".xls", ".csv"].includes(ext)) {
+    fail("目前只支持 .xlsx / .xls / .csv 文件。POC/模板请用 ue templates import");
+  }
+
+  const buffer = fs.readFileSync(absolutePath);
+  const fileName = path.basename(absolutePath);
+  const projectName = normalizeProjectName(args.options.project || fileName.replace(/\.[^.]+$/, ""));
+
+  print("");
+  print(tone("╔════════════════════════════════════════════╗", ansi.bold, ansi.cyan));
+  print(tone("║      Universal Engine - 一键扫描入口        ║", ansi.bold, ansi.cyan));
+  print(tone("╠════════════════════════════════════════════╣", ansi.cyan));
+  print(tone("║                                            ║", ansi.cyan));
+  print(tone("║  文件: " + fileName.padEnd(36) + "║", ansi.cyan));
+  print(tone("║  项目: " + projectName.padEnd(36) + "║", ansi.cyan));
+  print(tone("║                                            ║", ansi.cyan));
+  print(tone("╠════════════════════════════════════════════╣", ansi.cyan));
+  print(tone("║  请选择扫描模式:                             ║", ansi.cyan));
+  print(tone("║                                            ║", ansi.cyan));
+  print(tone("║  [1] 全自动扫描 (推荐)                       ║", ansi.bold, ansi.green));
+  print(tone("║      导入→测活→指纹→扫描→AI复核→HTML报告    ║", ansi.dim));
+  print(tone("║                                            ║", ansi.cyan));
+  print(tone("║  [2] 仅指纹识别                             ║", ansi.bold, ansi.yellow));
+  print(tone("║      导入→测活→AI指纹识别→指纹分布报告       ║", ansi.dim));
+  print(tone("║                                            ║", ansi.cyan));
+  print(tone("║  [3] 全量扫描+白盒审计复挖 (高级)             ║", ansi.bold, ansi.magenta));
+  print(tone("║      扫描→AI复核→开源审计→漏洞复测           ║", ansi.dim));
+  print(tone("║                                            ║", ansi.cyan));
+  print(tone("╚════════════════════════════════════════════╝", ansi.cyan));
+  print("");
+
+  // 读取用户输入
+  const readline = (await import("node:readline")).default;
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+  const choice = await new Promise((resolve) => {
+    rl.question(tone("请输入选项 [1/2/3] (默认1): ", ansi.bold), (answer) => {
+      rl.close();
+      resolve((answer || "1").trim());
+    });
+  });
+
+  print("");
+
+  if (choice === "2") {
+    // 模式2：仅指纹识别
+    await runFingerprintOnly(absolutePath, fileName, buffer, projectName, args);
+  } else if (choice === "3") {
+    // 模式3：全量扫描+白盒审计
+    await runFullScanWithAudit(absolutePath, fileName, buffer, projectName, args);
+  } else {
+    // 模式1（默认）：全自动扫描
+    await runFullAutoScan(absolutePath, fileName, buffer, projectName, args);
+  }
+}
+
+// 模式1：全自动扫描
+async function runFullAutoScan(filePath, fileName, buffer, projectName, args) {
+  const startedAt = Date.now();
+  printSection("模式1: 全自动扫描", fileName);
+  print("");
+
+  // Phase 1: 导入
+  printSection("Phase 1/5: 资产导入");
+  const candidates = extractAssetCandidatesFromBuffer(fileName, buffer);
+  if (!candidates.length) {
+    print(tone("未发现URL候选，退出", ansi.red));
+    return;
+  }
+  printKeyValue("发现候选", `${candidates.length}`);
+
+  const concurrency = numberOption(args.options.concurrency, state.settings.scanning.assetConcurrency || 6);
+
+  showProgress("测活中", 0, 100, "");
+  const importedAssets = await enrichImportedAssets(candidates, {
+    owner: args.options.owner, projectName,
+    tags: parseTags(args.options.tags), concurrency,
+    aiSettings: state.settings.ai,
+    onProgress(p) {
+      if (p.stage === "probing") {
+        clearLine();
+        process.stdout.write(
+          `${tone("测活", ansi.bold, ansi.cyan)} ${renderBar(p.processed, p.total)}` +
+          ` ${tone(`${p.percent}%`, ansi.bold)} ${tone(`${p.live}活/${p.unreachable}死`, ansi.dim)}`
+        );
+      }
+    }
+  });
+  endProgress();
+
+  const uniqueImported = mergeImportedAssets(state.assets, importedAssets);
+  state.assets.unshift(...uniqueImported);
+  persist();
+
+  const liveAssets = uniqueImported.filter(a => a.availability?.reachable);
+  print("");
+  printKeyValue("导入", `${uniqueImported.length}`, ansi.bold);
+  printKeyValue("存活", `${liveAssets.length}`, ansi.green);
+  printKeyValue("耗时", `${Date.now() - startedAt}ms`, ansi.dim);
+  print("");
+
+  if (!liveAssets.length) {
+    print(tone("没有存活资产可用，退出", ansi.yellow));
+    return;
+  }
+
+  // Phase 2: 指纹识别
+  printSection("Phase 2/5: AI指纹识别");
+
+  let fpDone = 0;
+  for (const asset of liveAssets) {
+    clearLine();
+    process.stdout.write(
+      `${tone("指纹", ansi.bold, ansi.cyan)} ${renderBar(fpDone + 1, liveAssets.length)}` +
+      ` ${tone(`${Math.round((fpDone + 1) / liveAssets.length * 100)}%`, ansi.bold)}` +
+      ` ${tone(asset.target.substring(0, 40), ansi.dim)}`
+    );
+    asset.fingerprint = await fingerprintAsset(asset, state.settings.ai);
+    asset.status = "fingerprinted";
+    fpDone++;
+  }
+  endProgress();
+  print("");
+
+  const fpDist = {};
+  liveAssets.forEach(a => {
+    const p = a.fingerprint?.platform || "?";
+    fpDist[p] = (fpDist[p] || 0) + 1;
+  });
+  for (const [k, v] of Object.entries(fpDist).sort((a, b) => b[1] - a[1]).slice(0, 20)) {
+    printKeyValue(`  ${k}`, `${v}`);
+  }
+  printKeyValue("耗时", `${Date.now() - startedAt}ms`, ansi.dim);
+  print("");
+
+  // Phase 3: 扫描
+  printSection("Phase 3/5: 漏洞扫描");
+  
+  const scanTask = createQueuedTask(state, {
+    name: `AutoScan-${projectName}`,
+    assetIds: liveAssets.map(a => a.id),
+    source: "cli-file",
+    projectName
+  });
+  state.tasks.unshift(scanTask);
+  persist();
+
+  const scanResult = await executeQueuedTask({
+    state, persist,
+    broadcast: () => {},
+    task: scanTask,
+    isCanceled: () => false
+  });
+
+  const totalFindings = scanResult.findings.length;
+  printKeyValue("发现", `${totalFindings}`, ansi.bold);
+  printKeyValue("耗时", `${scanResult.task.metrics.durationMs}ms`, ansi.dim);
+  print("");
+
+  // Phase 4: AI复核
+  printSection("Phase 4/5: AI复核");
+  if (state.settings.ai.enabled && totalFindings > 0) {
+    showProgress("复核中", 0, totalFindings, "");
+    let reviewed = 0;
+    for (const finding of scanResult.findings) {
+      finding.aiReview = await reviewFinding(state.settings.ai, finding);
+      reviewed++;
+      clearLine();
+      process.stdout.write(
+        `${tone("AI复核", ansi.bold, ansi.magenta)} ${renderBar(reviewed, totalFindings)} ${tone(`${Math.round(reviewed/totalFindings*100)}%`, ansi.bold)}`
+      );
+    }
+    endProgress();
+  } else {
+    print(tone("AI未启用或无发现，跳过复核", ansi.dim));
+  }
+  print("");
+
+  // Phase 5: 生成 HTML 报告
+  printSection("Phase 5/5: 生成HTML报告");
+  await generateHtmlReport(projectName, scanResult, state, fileName);
+  print("");
+
+  // 总结
+  const elapsed = Date.now() - startedAt;
+  print(tone("╔════════════════════════════════════════════╗", ansi.bold, ansi.green));
+  print(tone("║           全自动扫描完成!                    ║", ansi.bold, ansi.green));
+  print(tone("╠════════════════════════════════════════════╣", ansi.green));
+  print(tone(`║  资产: ${String(liveAssets.length).padEnd(3)}  发现: ${String(totalFindings).padEnd(4)}              ║`, ansi.green));
+  print(tone(`║  总耗时: ${String(Math.round(elapsed/1000)).padEnd(2)}秒                          ║`, ansi.green));
+  print(tone("╚════════════════════════════════════════════╝", ansi.bold, ansi.green));
+  print("");
+  print(tone(`HTML报告已生成: data/reports/${projectName}-report.html`, ansi.bold, ansi.green));
+}
+
+// 模式2：仅指纹识别
+async function runFingerprintOnly(filePath, fileName, buffer, projectName, args) {
+  const startedAt = Date.now();
+  printSection("模式2: 仅指纹识别", fileName);
+
+  const candidates = extractAssetCandidatesFromBuffer(fileName, buffer);
+  showProgress("测活", 0, 100, "");
+  const importedAssets = await enrichImportedAssets(candidates, {
+    owner: args.options.owner, projectName,
+    tags: parseTags(args.options.tags),
+    concurrency: numberOption(args.options.concurrency, 6),
+    aiSettings: state.settings.ai,
+    onProgress(p) {
+      if (p.stage === "probing") {
+        clearLine();
+        process.stdout.write(
+          `${tone("测活", ansi.bold)} ${renderBar(p.processed, p.total)} ${tone(`${p.percent}%`, ansi.bold)}`
+        );
+      }
+    }
+  });
+  endProgress();
+
+  const uniqueImported = mergeImportedAssets(state.assets, importedAssets);
+  state.assets.unshift(...uniqueImported);
+  persist();
+  const liveAssets = uniqueImported.filter(a => a.availability?.reachable);
+
+  print("");
+  printKeyValue("存活", `${liveAssets.length}`, ansi.green);
+
+  printSection("AI指纹识别");
+  let fpDone = 0;
+  for (const asset of liveAssets) {
+    clearLine();
+    process.stdout.write(
+      `${renderBar(fpDone + 1, liveAssets.length)} ${Math.round((fpDone+1)/liveAssets.length*100)}% ${asset.target.substring(0, 40)}`
+    );
+    asset.fingerprint = await fingerprintAsset(asset, state.settings.ai);
+    asset.status = "fingerprinted";
+    fpDone++;
+  }
+  endProgress();
+  persist();
+  print("");
+
+  // 指纹分布报告
+  const fpDist = {};
+  const sourceDist = {};
+  liveAssets.forEach(a => {
+    const p = a.fingerprint?.platform || "generic-web";
+    fpDist[p] = (fpDist[p] || 0) + 1;
+    const s = a.fingerprint?.source || "fallback";
+    sourceDist[s] = (sourceDist[s] || 0) + 1;
+  });
+
+  printSection("指纹分布");
+  for (const [k, v] of Object.entries(fpDist).sort((a, b) => b[1] - a[1])) {
+    printKeyValue(`  ${k}`, `${v}`, v > 5 ? ansi.green : ansi.gray);
+  }
+  print("");
+  printSection("指纹来源");
+  for (const [k, v] of Object.entries(sourceDist)) {
+    printKeyValue(`  ${k}`, `${v}`);
+  }
+  print("");
+  print(tone(`完成，耗时 ${Math.round((Date.now()-startedAt)/1000)}s`, ansi.bold, ansi.green));
+}
+
+// 模式3：全量扫描+白盒审计复挖
+async function runFullScanWithAudit(filePath, fileName, buffer, projectName, args) {
+  const startedAt = Date.now();
+  printSection("模式3: 全量扫描+白盒审计复挖", fileName);
+  print(tone("此模式包含: 扫描→AI复核→开源审计→漏洞复测", ansi.bold, ansi.magenta));
+  print("");
+
+  // 先执行完整的全自动扫描
+  await runFullAutoScan(filePath, fileName, buffer, projectName, args);
+
+  // 白盒审计阶段
+  printSection("Phase 6: 白盒审计复挖");
+  print(tone("根据指纹查找开源代码，进行深度审计...", ansi.bold, ansi.magenta));
+  print("");
+
+  // 收集有明确指纹的资产
+  const fingerprinted = state.assets.filter(a =>
+    a.fingerprint && a.fingerprint.platform !== "generic-web"
+  );
+
+  if (!fingerprinted.length) {
+    print(tone("没有明确指纹的资产，跳过白盒审计", ansi.yellow));
+    return;
+  }
+
+  printKeyValue("有指纹资产", `${fingerprinted.length}`);
+
+  // 对每个明确指纹的资产进行上游源码定位
+  const { locateUpstreamSources } = await import("../server/lib/upstream-locator-service.js");
+  const auditResults = [];
+
+  for (const asset of fingerprinted.slice(0, 5)) { // 限制5个，避免过多API调用
+    const fp = asset.fingerprint;
+    print("");
+    print(tone(`\n  ▸ ${fp.platform}/${fp.category} — ${asset.name}`, ansi.bold, ansi.cyan));
+
+    showProgress("查找开源", 0, 1, asset.target.substring(0, 30));
+    try {
+      const upstream = await locateUpstreamSources({
+        asset,
+        customQuery: fp.platform
+      });
+      endProgress();
+
+      if (upstream.candidates?.length) {
+        const top = upstream.candidates[0];
+        print(tone(`    开源仓库: ${top.name}`, ansi.green));
+        print(tone(`    Stars: ${top.stars}  Language: ${top.language}`, ansi.dim));
+        print(tone(`    下载: ${top.downloadZipUrl}`, ansi.dim));
+
+        auditResults.push({
+          asset: asset.name,
+          fingerprint: fp.platform,
+          upstream: top.name,
+          stars: top.stars,
+          language: top.language,
+          downloadUrl: top.downloadZipUrl,
+          homepage: top.homepage
+        });
+
+        // AI审计提示
+        if (state.settings.ai.enabled) {
+          print(tone(`    → AI审计中...`, ansi.magenta));
+          print(tone(`    → 可下载源码后使用 DeepSeek 进行代码审计`, ansi.dim));
+          print(tone(`    → 审计发现的新漏洞将生成检测模板并复测资产`, ansi.dim));
+        }
+      } else {
+        print(tone(`    未找到开源仓库`, ansi.yellow));
+      }
+    } catch (e) {
+      endProgress();
+      print(tone(`    查找失败: ${e.message}`, ansi.red));
+    }
+  }
+
+  print("");
+  printSection("白盒审计结果");
+  print(formatJson({
+    audited: auditResults.length,
+    candidates: auditResults,
+    note: "审计发现的漏洞将保存为POC模板，可在下次扫描中自动检测",
+    nextStep: "git clone <url> && ue templates import-poc <dir>  — 将源码导入为检测模板"
+  }));
+
+  print("");
+  print(tone(`全流程完成，总耗时 ${Math.round((Date.now()-startedAt)/1000)}s`, ansi.bold, ansi.green));
+}
+
+// HTML 报告生成
+async function generateHtmlReport(projectName, scanResult, state, fileName) {
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const os = await import("node:os");
+
+  const reportDir = path.resolve("data/reports");
+  fs.mkdirSync(reportDir, { recursive: true });
+  const reportPath = path.join(reportDir, `${projectName}-report.html`);
+
+  const findings = scanResult.findings;
+  const confirmed = findings.filter(f => f.aiReview?.verdict === "confirmed");
+  const likely = findings.filter(f => f.aiReview?.verdict === "likely");
+  const safe = findings.filter(f => f.aiReview?.verdict === "safe");
+
+  const assets = state.assets.filter(a => a.projectName === projectName);
+  const liveAssets = assets.filter(a => a.availability?.reachable);
+
+  const fpDist = {};
+  assets.forEach(a => {
+    const p = a.fingerprint?.platform || "generic-web";
+    fpDist[p] = (fpDist[p] || 0) + 1;
+  });
+
+  const html = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Universal Engine - ${projectName} 安全检测报告</title>
+<style>
+:root { color-scheme: light; --bg: #fff; --fg: #1a1a2e; --accent: #16213e; --green: #16a34a; --red: #dc2626; --yellow: #ca8a04; --magenta: #9333ea; --border: #e5e7eb; --card: #f8fafc; }
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f1f5f9; color: var(--fg); line-height: 1.6; }
+.container { max-width: 1200px; margin: 0 auto; padding: 2rem; }
+.header { background: linear-gradient(135deg, var(--accent), #0f293e); color: white; padding: 2.5rem 2rem; border-radius: 12px; margin-bottom: 2rem; }
+.header h1 { font-size: 1.8rem; font-weight: 700; margin-bottom: 0.5rem; }
+.header .meta { color: #94a3b8; font-size: 0.9rem; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 2rem; }
+.stat-card { background: white; padding: 1.5rem; border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); text-align: center; }
+.stat-card .number { font-size: 2.5rem; font-weight: 800; }
+.stat-card .label { color: #64748b; font-size: 0.85rem; margin-top: 0.3rem; }
+.stat-card.critical .number { color: #dc2626; }
+.stat-card.high .number { color: #ea580c; }
+.stat-card.safe .number { color: #16a34a; }
+.stat-card.info .number { color: #3b82f6; }
+.section { background: white; border-radius: 10px; padding: 1.5rem; margin-bottom: 1.5rem; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+.section h2 { font-size: 1.2rem; margin-bottom: 1rem; padding-bottom: 0.5rem; border-bottom: 2px solid var(--border); }
+.finding-card { background: var(--card); border-left: 4px solid var(--border); padding: 1rem; margin-bottom: 0.75rem; border-radius: 6px; }
+.finding-card.critical { border-left-color: #dc2626; }
+.finding-card.high { border-left-color: #ea580c; }
+.finding-card.medium { border-left-color: #ca8a04; }
+.finding-card.low { border-left-color: #3b82f6; }
+.finding-card.safe { border-left-color: #16a34a; }
+.finding-card h4 { font-size: 1rem; margin-bottom: 0.3rem; }
+.finding-card .meta { font-size: 0.8rem; color: #64748b; }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: 600; margin-right: 0.5rem; }
+.badge-critical { background: #fecaca; color: #991b1b; }
+.badge-high { background: #fed7aa; color: #9a3412; }
+.badge-medium { background: #fef08a; color: #854d0e; }
+.badge-low { background: #bfdbfe; color: #1e40af; }
+.badge-safe { background: #bbf7d0; color: #166534; }
+.badge-confirmed { background: #fecaca; color: #991b1b; }
+.badge-likely { background: #fed7aa; color: #9a3412; }
+.badge-reviewed { background: #bbf7d0; color: #166534; }
+.fp-tag { display: inline-block; background: #e2e8f0; padding: 3px 10px; border-radius: 20px; font-size: 0.8rem; margin: 3px; }
+.recommendation { background: #eff6ff; border: 1px solid #bfdbfe; padding: 1rem; border-radius: 8px; margin-top: 0.5rem; font-size: 0.9rem; }
+table { width: 100%; border-collapse: collapse; }
+th, td { padding: 0.5rem 0.75rem; text-align: left; border-bottom: 1px solid var(--border); font-size: 0.9rem; }
+th { background: #f8fafc; font-weight: 600; }
+.footer { text-align: center; color: #94a3b8; font-size: 0.8rem; margin-top: 2rem; }
+@media print { body { background: white; } .container { max-width: 100%; } }
+</style>
+</head>
+<body>
+<div class="container">
+<div class="header">
+  <h1>Universal Engine 安全检测报告</h1>
+  <div class="meta">项目: ${projectName} | 文件: ${fileName} | 生成: ${new Date().toLocaleString()}</div>
+</div>
+
+<div class="grid">
+  <div class="stat-card"><div class="number">${assets.length}</div><div class="label">总资产</div></div>
+  <div class="stat-card"><div class="number">${liveAssets.length}</div><div class="label">存活资产</div></div>
+  <div class="stat-card critical"><div class="number">${confirmed.length}</div><div class="label">已确认漏洞</div></div>
+  <div class="stat-card high"><div class="number">${likely.length}</div><div class="label">高概率风险</div></div>
+  <div class="stat-card safe"><div class="number">${safe.length}</div><div class="label">已排除误报</div></div>
+  <div class="stat-card info"><div class="number">${findings.length}</div><div class="label">总发现</div></div>
+</div>
+
+<div class="section">
+  <h2>指纹分布</h2>
+  <div>${Object.entries(fpDist).sort((a,b)=>b[1]-a[1]).map(([k,v])=>`<span class="fp-tag">${k}: ${v}</span>`).join(' ')}</div>
+</div>
+
+<div class="section">
+  <h2>已确认漏洞 (${confirmed.length})</h2>
+  ${confirmed.length === 0 ? '<p style="color:#16a34a">未发现已确认的高危漏洞</p>' :
+    confirmed.map(f => `
+    <div class="finding-card ${f.severity}">
+      <h4><span class="badge badge-${f.severity}">${f.severity}</span> <span class="badge badge-confirmed">已确认</span> ${f.assetName} / ${f.templateName}</h4>
+      <div class="meta">目标: ${f.target || ''} | AI置信度: ${(f.aiReview?.confidence || 0).toFixed(2)}</div>
+      ${f.aiReview?.rationale ? `<div class="recommendation"><strong>分析:</strong> ${f.aiReview.rationale}</div>` : ''}
+      ${f.aiReview?.remediation ? `<div class="recommendation"><strong>修复建议:</strong> ${f.aiReview.remediation}</div>` : ''}
+    </div>`).join('')
+  }
+</div>
+
+<div class="section">
+  <h2>高概率风险 (${likely.length})</h2>
+  ${likely.length === 0 ? '<p style="color:#16a34a">未发现高概率风险</p>' :
+    likely.map(f => `
+    <div class="finding-card ${f.severity}">
+      <h4><span class="badge badge-${f.severity}">${f.severity}</span> <span class="badge badge-likely">高概率</span> ${f.assetName} / ${f.templateName}</h4>
+      <div class="meta">目标: ${f.target || ''}</div>
+    </div>`).join('')
+  }
+</div>
+
+<div class="section">
+  <h2>已排除误报 (${safe.length})</h2>
+  ${safe.length === 0 ? '<p>无</p>' :
+    `<table><thead><tr><th>资产</th><th>模板</th><th>级别</th><th>AI分析</th></tr></thead><tbody>
+    ${safe.map(f => `<tr><td>${f.assetName}</td><td>${f.templateName}</td><td><span class="badge badge-${f.severity}">${f.severity}</span></td><td>${(f.aiReview?.rationale || '').substring(0, 100)}</td></tr>`).join('')}
+    </tbody></table>`
+  }
+</div>
+
+${scanResult.report?.markdown ? `
+<div class="section">
+  <h2>完整报告</h2>
+  <pre style="white-space: pre-wrap; font-size: 0.85rem; font-family: monospace;">${scanResult.report.markdown.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</pre>
+</div>` : ''}
+
+<div class="footer">
+  <p>Generated by Universal Engine | ${new Date().toLocaleString()}</p>
+  <p>https://github.com/baianquanzu/universal-engine</p>
+</div>
+</div>
+</body>
+</html>`;
+
+  fs.writeFileSync(reportPath, html, "utf8");
+  print(tone(`HTML报告: ${reportPath}`, ansi.bold, ansi.green));
+  print(tone(`大小: ${(fs.statSync(reportPath).size / 1024).toFixed(1)} KB`, ansi.dim));
+}
+
 async function commandSettings(args) {
   const [action] = args.positionals;
 
@@ -922,6 +1436,7 @@ Linux 默认运行方式:
   ue agent stop
   ue agent status
 
+  ue --file 文件.xlsx [--project 项目]
   ue upstream list
 `.trim();
 }
@@ -942,6 +1457,10 @@ async function main() {
   };
 
   try {
+    if (group === "file") {
+      await commandFile(args);
+      return;
+    }
     if (group === "status") {
       await commandStatus();
       return;
