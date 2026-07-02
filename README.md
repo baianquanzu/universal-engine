@@ -1,195 +1,303 @@
-# Universal Engine CLI
+<p align="center">
+  <img src="https://img.shields.io/badge/platform-linux%20%7C%20kali-blue" alt="Platform">
+  <img src="https://img.shields.io/badge/node-%3E%3D18-green" alt="Node">
+  <img src="https://img.shields.io/badge/license-MIT-brightgreen" alt="License">
+  <img src="https://img.shields.io/github/stars/baianquanzu/universal-engine?style=social" alt="Stars">
+</p>
 
-Universal Engine 目前已经收敛为一个面向 Linux 终端的防守型 CLI 工具，用于：
+# Universal Engine
 
-- 管理资产与项目
-- 批量导入表格资产
-- 对资产做测活与指纹识别
-- 导入安全检测模板库
-- 按指纹路由模板并执行检测
-- 输出发现与报告
-- 查询上游开源仓库地址
+> Defense-oriented N-day vulnerability detection engine with AI-assisted intelligence.
+> Built for Kali Linux. Designed for security researchers.
 
-当前入口风格同时支持传统子命令和接近 `nmap` 的单命令参数风格。
+**Universal Engine** is an intelligent asset reconnaissance and vulnerability scanning platform that combines traditional security scanners (nuclei, nmap, nikto, sqlmap) with AI-powered decision making. It detects known vulnerabilities (N-day), fingerprints web assets, and generates actionable security reports — all from a single CLI.
 
-## 安装
+## Features
+
+<table>
+<tr>
+<td width="50%">
+
+### 🔍 Asset Intelligence
+- **Bulk Import** — Drag & drop `.xlsx`/`.csv` files or use CLI for 1000+ assets
+- **Live Probing** — Concurrent HTTP probing with real-time progress bars
+- **AI Classification** — DeepSeek-powered business categorization (portal, API, CMS, admin console...)
+- **IP:Port Auto-detection** — Smart parsing of IP/port column pairs
+
+### 🎯 Fingerprint Engine
+- **30+ Built-in Rules** — WordPress, Spring Boot, Tomcat, Weblogic, Shiro, 中国移动OA/ERP...
+- **AI-Assisted** — Falls back to AI when built-in rules are uncertain
+- **Multi-source** — FingerprintHub + Wappalyzer + EHole rule libraries
+
+</td>
+<td width="50%">
+
+### ⚔️ Vulnerability Scanning
+- **Nuclei Integration** — Run 10,000+ community templates
+- **Kali Toolbox** — Automatic nmap NSE, nikto, sqlmap orchestration
+- **Smart Strategy** — Fingerprint-based tool selection:
+  - WordPress → nuclei + nikto + sqlmap
+  - Java → nuclei + nmap http-*
+  - Database → sqlmap + nmap
+- **4 Scan Modes** — Quick / Standard / Deep / Full
+- **20 Built-in Filters** — Removes low-value findings (missing headers, info leaks)
+
+### 🤖 AI Agent Cluster
+- **Agent Hub** — WebSocket + REST message bus
+- **7 Specialized Agents** — File Watcher, POC Converter, Scan Executor, Kali Toolbox, AI Reviewer, Orchestrator
+- **Auto Pipeline** — File dropped → classified → fingerprinted → scanned → reviewed → reported
+- **Real-time Progress** — Colored progress bars for every operation
+
+</td>
+</tr>
+</table>
+
+## Quick Start
+
+### Prerequisites
+
+- **Kali Linux** (recommended) or any Debian-based Linux
+- **Node.js** >= 18
+- **nuclei**, **nmap**, **nikto**, **sqlmap** (auto-detected on Kali)
+
+### Installation
 
 ```bash
-cd /opt/universal-engine
+# Clone the repository
+git clone https://github.com/baianquanzu/universal-engine.git
+cd universal-engine
+
+# Install dependencies
 npm install
-chmod +x ./install-linux.sh
+
+# Install system-wide
+chmod +x install-linux.sh
 sudo ./install-linux.sh
-```
 
-安装完成后可直接使用：
-
-```bash
+# Verify installation
+ue --help
 ue --status
 ```
 
-如果不安装系统级软链接，也可以直接运行：
+## Usage
+
+### One-Line Asset Import
 
 ```bash
-./ue --status
+# Import from XLSX with real-time progress bar
+ue assets import-file targets.xlsx --project "Q3-Pentest" --owner "RedTeam"
+
+# Output:
+# ╭─ 资产导入 targets.xlsx ────────────────────────────╮
+# 文件           targets.xlsx
+# 大小           136.5 KB
+# 提取URL候选    247
+#
+# ╭─ 资产测活 ──────────────────────────────────────╮
+# ████████████████░░░░░░░░░░ 67% [165/247]
+# └─ https://oss.example.com 200 "管理后台"
+#
+# ╰──────────────────────────────────────────────────╯
+# 存活          142  ✓
+# 不可达        105  ✗
+```
+
+### Fingerprint & Scan
+
+```bash
+# AI-assisted fingerprinting
+ue assets refingerprint --project "Q3-Pentest"
+
+# Run a full scan with AI review
+ue settings set ai.enabled=true ai.apiKey=sk-your-deepseek-key
+ue scans run --project "Q3-Pentest" --name "Baseline"
+
+# View results
+ue findings list --project "Q3-Pentest"
+ue reports latest --project "Q3-Pentest" --format md
+```
+
+### POC Import
+
+```bash
+# Import any POC format — zip, directory, single file
+ue templates import-poc ./0day-exploits.zip
+
+# Supported types: .py .c .sh .java .php .go .ps1 .bat .rb .pl .cs .cpp .js .ts .rs
+# Auto-extracts: CVE IDs, product name, severity, version range, category
+# Output: 23 POCs imported across 15 framework families
+```
+
+### Agent Mode (Recommended)
+
+```bash
+# Start the full agent cluster
+ue agent start
+
+# Drop files into data/incoming/ — everything happens automatically:
+# .xlsx → import → fingerprint → scan → AI review → report
+# .zip  → POC convert → template merge
+# .yaml → template import → merge
+
+# Check cluster status
+ue agent status
+# {
+#   "agents": [
+#     {"type": "orchestrator", "status": "online"},
+#     {"type": "file-watcher", "status": "watching"},
+#     {"type": "scan-executor", "status": "ready"},
+#     ...
+#   ],
+#   "queue": {"pending": 0, "running": 1, "completed": 12}
+# }
+```
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                   Universal Engine                       │
+├─────────────────────────────────────────────────────────┤
+│  CLI (ue)  │  Agent Hub (WS+REST)  │  File Watcher      │
+├─────────────────────────────────────────────────────────┤
+│                     Agent Cluster                        │
+│  ┌───────────┐  ┌────────────┐  ┌───────────────────┐  │
+│  │Orchestrator│  │POC Converter│  │  Scan Executor    │  │
+│  │ (Pipeline) │  │ (50+ langs) │  │ (4 modes/20 filt) │  │
+│  └───────────┘  └────────────┘  └───────────────────┘  │
+│  ┌───────────┐  ┌────────────┐  ┌───────────────────┐  │
+│  │Fingerprinter│ │Kali Toolbox │  │   AI Reviewer     │  │
+│  │ (30+ rules) │ │(7 tools)    │  │ (DeepSeek/OpenAI) │  │
+│  └───────────┘  └────────────┘  └───────────────────┘  │
+├─────────────────────────────────────────────────────────┤
+│  Nuclei  │  nmap  │  nikto  │  sqlmap  │  httpx          │
+└─────────────────────────────────────────────────────────┘
+```
+
+## Configuration
+
+```bash
+# View all settings
+ue settings show
+
+# Enable AI review
+ue settings set ai.enabled=true ai.apiKey=sk-your-key ai.provider=deepseek
+
+# Enable nuclei scanning
+ue settings set nuclei.enabled=true
+
+# Configure scan concurrency
+ue settings set scanning.assetConcurrency=6 scanning.maxConcurrentTasks=3
+
+# Disable auto AI review (faster scanning)
+ue settings set scanning.autoAiReview=false
+```
+
+### AI Providers
+
+| Provider | Setting |
+|----------|---------|
+| DeepSeek | `ai.provider=deepseek ai.baseUrl=https://api.deepseek.com` |
+| OpenAI | `ai.provider=openai-compatible ai.baseUrl=https://api.openai.com/v1` |
+| Anthropic | `ai.provider=anthropic` |
+| Ollama (local) | `ai.provider=ollama ai.baseUrl=http://localhost:11434` |
+
+## Command Reference
+
+### Asset Management
+```bash
+ue assets import-file <file>       # Import XLSX/CSV with live progress
+ue assets add --name <n> --target <url>  # Add single asset
+ue assets list [--project <name>]  # List assets
+ue assets refingerprint [--project <name>]  # Re-fingerprint with AI
+ue assets delete [--project <name>]  # Delete assets
+```
+
+### Template Management
+```bash
+ue templates import <path>         # Import nuclei/YAML templates
+ue templates import-poc <path>     # Import POC packages (any format)
+ue templates groups                # Show template family distribution
+ue templates list [--family cms]   # List templates by family
+```
+
+### Scanning
+```bash
+ue scans run [--project <name>] [--asset-id <ids>] [--name <n>]
+ue scans list                      # View scan tasks
+ue scans clear-finished            # Clean up completed tasks
+```
+
+### Findings & Reports
+```bash
+ue findings list [--project <name>]
+ue findings clear [--project <name>]
+ue reports latest [--project <name>] [--format md|json] [--output <file>]
+```
+
+### Agent Cluster
+```bash
+ue agent start                     # Start full agent cluster
+ue agent stop                      # Stop cluster
+ue agent status                    # View agent status
+```
+
+### Settings
+```bash
+ue settings show
+ue settings set ai.enabled=true nuclei.enabled=true
+```
+
+## Use Cases
+
+### Web Asset Inventory
+Import thousands of web assets from spreadsheets, automatically probe for live hosts, and classify by business function — all with a single command.
+
+### N-Day Vulnerability Assessment
+Match your asset fingerprints against known vulnerability templates. When a new CVE drops for WordPress or Spring Boot, re-scan immediately with updated templates.
+
+### POC Library Management
+Convert any security research POC into a searchable, classified template. Import directories, zip files, or paste code snippets. The AI extracts CVE IDs, affected versions, and categorizes automatically.
+
+### Automated Pentest Pipeline
+Drop a spreadsheet of targets into the incoming folder. The agent cluster handles everything: probing → fingerprinting → scanning → AI review → report generation. Go get coffee.
+
+## FAQ
+
+**Q: Do I need Kali Linux?**
+A: Kali is recommended for built-in tool support (nmap, nikto, sqlmap). The engine works on any Linux, but you'll need to install the tools separately.
+
+**Q: Is AI required?**
+A: No. AI is optional and enhances fingerprint accuracy and finding review quality. All core features work without it.
+
+**Q: How does POC import work?**
+A: The POC Converter agent analyzes directory names, README files, code comments, and file extensions. It extracts CVE IDs, product names, severity levels, and categorizes findings using 50+ detection patterns.
+
+**Q: Can I contribute templates?**
+A: Yes! Universal Engine supports standard nuclei templates (`.yaml`) and POC packages (any directory structure with a README). Submit via PR.
+
+## Contributing
+
+```bash
+# Development setup
+git clone https://github.com/baianquanzu/universal-engine.git
+cd universal-engine
+npm install
+npm run dev          # Start with watch mode
+
+# Run tests
 node cli/ue.js --status
+node cli/ue.js templates groups
 ```
 
-## 常用命令
+See [DEVELOPMENT.md](DEVELOPMENT.md) for architecture details.
 
-### nmap 风格
+## License
 
-```bash
-ue --status
-ue --assets-list --project "Lab"
-ue --asset-add --name "Demo" --target "https://demo.local" --project "Lab"
-ue --assets-import-file --file ./targets.xlsx --project "Lab" --owner "Ops" --tags web,external
-ue --assets-refingerprint --project "Lab"
-ue --templates-import --path ./templates.zip
-ue --templates-groups
-ue --scan --project "Lab" --name "Nightly Scan"
-ue --findings-list --project "Lab"
-ue --report-latest --project "Lab" --format md --output ./lab-report.md
-ue --settings-show
-ue --upstream-lookup --query wordpress
-```
+MIT License — see [LICENSE](LICENSE) file.
 
-### 传统子命令风格
+---
 
-```bash
-ue status
-ue assets list --project "Lab"
-ue assets add --name "Demo" --target "https://demo.local"
-ue assets import-file ./targets.xlsx --project "Lab"
-ue assets refingerprint --project "Lab"
-ue templates import ./templates.zip
-ue templates groups
-ue scans run --project "Lab"
-ue reports latest --format json
-```
-
-## 典型使用流程
-
-1. 查看状态与配置
-
-```bash
-ue --status
-ue --settings-show
-```
-
-2. 导入资产
-
-```bash
-ue assets import-file ./targets.xlsx --project "Q3-External"
-```
-
-3. 进行指纹识别
-
-```bash
-ue assets refingerprint --project "Q3-External"
-```
-
-4. 导入模板库
-
-```bash
-ue templates import ./template-pack.zip
-```
-
-5. 发起扫描
-
-```bash
-ue scans run --project "Q3-External" --name "Baseline Scan"
-```
-
-6. 导出结果
-
-```bash
-ue findings list --project "Q3-External"
-ue reports latest --project "Q3-External" --format md --output ./baseline-report.md
-```
-
-## 安全模板导入规则
-
-当前模板导入器是“安全标准化管道”，不会把所有文件直接转成可执行检测逻辑。
-
-支持导入：
-
-- `zip`
-- `yaml`
-- `yml`
-- `json`
-- `md`
-- `txt`
-
-导入时会自动：
-
-- 提取 `CVE`、产品名、标签、严重级别、引用链接
-- 将内容标准化为统一模板记录
-- 识别 `nuclei` 检测模板
-- 区分 `runnable` 与 `metadataOnly`
-- 做去重与分类归档
-
-默认拦截：
-
-- `py`
-- `js`
-- `ts`
-- `go`
-- `php`
-- `sh`
-- `ps1`
-- `bat`
-- `cmd`
-- `exe`
-- `dll`
-- `jar`
-- 其他脚本或二进制类型
-
-导入结果会返回：
-
-- `imported`
-- `skippedDuplicates`
-- `importStats`
-- `groups`
-
-其中 `importStats` 会给出：
-
-- `runnableTemplates`
-- `metadataOnlyTemplates`
-- `blockedFiles`
-- `unsupportedFiles`
-- `templatesByFamily`
-- `templatesBySourceType`
-
-## 当前能力边界
-
-- 只允许安全可审计的检测模板进入执行链
-- 元数据模板只用于归档、分类、比对，不执行
-- 上游定位功能只返回源码仓库地址，不自动下载审计
-- 默认数据存储在本地 JSON 状态文件中，不依赖数据库
-
-## 目录结构
-
-```text
-universal engine/
-  cli/                  CLI 入口
-  ue                    Linux 启动器
-  install-linux.sh      Linux 安装脚本
-  server/lib/           核心服务层
-  server/scripts/       辅助脚本
-  data/runtime/         运行态数据
-  public/               旧前端静态资源
-```
-
-## 运行数据
-
-运行态默认保存在：
-
-```text
-data/runtime/state.json
-```
-
-## 附加说明
-
-- `npm start` 当前默认启动 CLI
-- `npm run server` 仍可临时启动旧服务端
-- 更完整的开发说明见 [DEVELOPMENT.md](./DEVELOPMENT.md)
+<p align="center">
+  <sub>Built with ❤️ for the security research community</sub>
+</p>
