@@ -1,0 +1,31 @@
+{
+  "name": "universal-engine",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Universal Engine CLI for defensive N-day asset detection on Linux.",
+  "bin": {
+    "ue": "./cli/ue.js"
+  },
+  "scripts": {
+    "start": "node cli/ue.js",
+    "cli": "node cli/ue.js",
+    "server": "node server/index.js",
+    "dev": "node --watch server/index.js",
+    "import:github-templates": "node server/scripts/import-github-templates.js",
+    "agent": "node server/agents/agent-launcher.js start",
+    "agent:hub": "node server/agent-hub.js",
+    "agent:status": "node server/agents/agent-launcher.js status",
+    "agent:dev": "node --watch server/agent-hub.js"
+  },
+  "dependencies": {
+    "adm-zip": "^0.5.16",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "multer": "^2.0.2",
+    "uuid": "^11.1.0",
+    "ws": "^8.18.0",
+    "xlsx": "^0.18.5",
+    "yaml": "^2.8.1"
+  }
+}

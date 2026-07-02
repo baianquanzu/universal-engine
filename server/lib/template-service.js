@@ -1,0 +1,1243 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import AdmZip from "adm-zip";
+import YAML from "yaml";
+import { v4 as uuidv4 } from "uuid";
+
+const sampleTemplatePath = path.resolve("data/templates/sample-wordpress-audit.yaml");
+
+const frameworkFamilies = [
+  {
+    name: "cms",
+    products: ["wordpress", "drupal", "joomla", "dede", "discuz", "ecshop", "thinkcmf", "pbootcms"]
+  },
+  {
+    name: "java",
+    products: ["spring", "springboot", "struts", "weblogic", "jboss", "tomcat", "jenkins", "confluence", "shiro"]
+  },
+  {
+    name: "php",
+    products: ["laravel", "thinkphp", "phpmyadmin", "yii", "codeigniter", "dedecms", "wordpress"]
+  },
+  {
+    name: "python",
+    products: ["django", "flask", "fastapi", "superset"]
+  },
+  {
+    name: "node",
+    products: ["express", "nextjs", "next.js", "nestjs", "nodejs"]
+  },
+  {
+    name: "dotnet",
+    products: ["asp.net", "aspnet", ".net", "iis", "sharepoint", "exchange"]
+  },
+  {
+    name: "middleware",
+    products: ["nginx", "apache", "redis", "elasticsearch", "kibana", "rabbitmq", "zookeeper", "activemq"]
+  },
+  {
+    name: "network-appliance",
+    products: ["fortinet", "paloalto", "f5", "hikvision", "dahua", "sangfor", "panos"]
+  }
+];
+
+const pocFrameworkFamilies = [
+  {
+    name: "desktop-app",
+    products: ["anydesk", "rustdesk", "7-zip", "7zip", "vlc", "openvpn"]
+  },
+  {
+    name: "c-library",
+    products: ["c-ares", "libssh2", "nghttp2"]
+  },
+  {
+    name: "container",
+    products: ["docker"]
+  },
+  {
+    name: "binary-tool",
+    products: ["nmap", "objdump", "ghidra", "imagemagick", "ffmpeg"]
+  },
+  {
+    name: "browser",
+    products: ["firefox"]
+  },
+  {
+    name: "ci-cd",
+    products: ["gitea", "flowise", "lunar"]
+  },
+  {
+    name: "os-app",
+    products: ["systeminformer"]
+  }
+];
+
+const allFamilies = [...frameworkFamilies, ...pocFrameworkFamilies];
+
+const safeTextExtensions = new Set([".yaml", ".yml", ".json", ".md", ".txt"]);
+const safeArchiveExtensions = new Set([".zip"]);
+const blockedExtensions = new Set([
+  ".py",
+  ".pyc",
+  ".js",
+  ".mjs",
+  ".cjs",
+  ".ts",
+  ".go",
+  ".java",
+  ".class",
+  ".jar",
+  ".php",
+  ".asp",
+  ".aspx",
+  ".jsp",
+  ".sh",
+  ".bash",
+  ".zsh",
+  ".ps1",
+  ".psm1",
+  ".bat",
+  ".cmd",
+  ".exe",
+  ".dll",
+  ".bin",
+  ".so",
+  ".dylib",
+  ".rb",
+  ".pl"
+]);
+
+const safeNucleiSections = ["http", "requests", "dns", "tcp", "headless", "file", "workflows"];
+const dangerousNucleiSections = ["javascript", "code"];
+
+function toArray(value) {
+  if (!value) {
+    return [];
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => `${item}`.trim()).filter(Boolean);
+  }
+
+  return `${value}`
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function normalize(value) {
+  return `${value ?? ""}`.trim().toLowerCase();
+}
+
+function unique(values) {
+  return [...new Set(values.filter(Boolean))];
+}
+
+function trimText(value) {
+  return `${value ?? ""}`.replace(/\s+/g, " ").trim();
+}
+
+function stripBom(value) {
+  return `${value ?? ""}`.replace(/^\uFEFF/, "");
+}
+
+function sanitizeFileLabel(fileName) {
+  return path
+    .basename(fileName, path.extname(fileName))
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function inferSeverity(text, fallback = "info") {
+  const normalized = normalize(text);
+  if (/(critical|severe|urgent|严重)/.test(normalized)) {
+    return "critical";
+  }
+  if (/(high|important|高危)/.test(normalized)) {
+    return "high";
+  }
+  if (/(medium|moderate|中危)/.test(normalized)) {
+    return "medium";
+  }
+  if (/(low|notice|低危)/.test(normalized)) {
+    return "low";
+  }
+  if (/(info|informational|信息)/.test(normalized)) {
+    return "info";
+  }
+  return fallback;
+}
+
+function extractCveIds(text) {
+  return unique(
+    `${text ?? ""}`.match(/CVE-\d{4}-\d{4,8}/gi)?.map((item) => item.toUpperCase()) ?? []
+  );
+}
+
+function extractReferences(text) {
+  return unique(`${text ?? ""}`.match(/https?:\/\/[^\s)"']+/gi) ?? []);
+}
+
+function inferFrameworkFamily(product, category, tags, sourceName, name) {
+  const signals = [product, category, sourceName, name, ...tags].map(normalize).filter(Boolean);
+
+  for (const family of frameworkFamilies) {
+    if (family.products.some((productName) => signals.some((signal) => signal.includes(productName)))) {
+      return family.name;
+    }
+  }
+
+  if (signals.some((signal) => signal.includes("cms"))) {
+    return "cms";
+  }
+
+  if (signals.some((signal) => signal.includes("oa") || signal.includes("erp"))) {
+    return "enterprise-app";
+  }
+
+  if (signals.some((signal) => signal.includes("firewall") || signal.includes("vpn") || signal.includes("appliance"))) {
+    return "network-appliance";
+  }
+
+  return "generic";
+}
+
+function inferCategory(product, tags, fallback) {
+  const normalizedProduct = normalize(product);
+  const normalizedTags = tags.map(normalize);
+
+  if (normalizedTags.includes("cms") || normalizedProduct.includes("wordpress") || normalizedProduct.includes("drupal")) {
+    return "cms";
+  }
+
+  if (normalizedTags.includes("mail") || normalizedProduct.includes("exchange")) {
+    return "mail";
+  }
+
+  if (normalizedTags.includes("oa") || normalizedTags.includes("erp")) {
+    return "enterprise-app";
+  }
+
+  if (normalizedTags.includes("middleware")) {
+    return "middleware";
+  }
+
+  if (normalizedTags.includes("framework")) {
+    return "framework";
+  }
+
+  if (normalizedTags.includes("network") || normalizedTags.includes("vpn")) {
+    return "network-device";
+  }
+
+  return fallback || "uncategorized";
+}
+
+function inferProductFromSignals(...signals) {
+  const flattened = signals
+    .flatMap((value) => (Array.isArray(value) ? value : [value]))
+    .map(normalize)
+    .filter(Boolean);
+
+  for (const family of frameworkFamilies) {
+    for (const product of family.products) {
+      if (flattened.some((signal) => signal.includes(product))) {
+        return product;
+      }
+    }
+  }
+
+  return "generic";
+}
+
+function buildTemplateIdentity(template) {
+  const normalizedId = normalize(template.nucleiId);
+  const normalizedName = normalize(template.name);
+  const normalizedProduct = normalize(template.product);
+  const normalizedFamily = normalize(template.frameworkFamily);
+  const normalizedCategory = normalize(template.category);
+  const cveSignature = [...(template.cveIds ?? [])].map(normalize).sort().join(",");
+  const tagSignature = [...(template.tags ?? [])].map(normalize).sort().join(",");
+
+  if (normalizedId) {
+    return `id:${normalizedId}`;
+  }
+
+  return `shape:${normalizedName}|${normalizedProduct}|${normalizedFamily}|${normalizedCategory}|${cveSignature}|${tagSignature}`;
+}
+
+function dedupeTemplates(templates) {
+  const seen = new Set();
+  return templates.filter((template) => {
+    const key = buildTemplateIdentity(template);
+    if (seen.has(key)) {
+      return false;
+    }
+
+    seen.add(key);
+    return true;
+  });
+}
+
+function isSupportedExtension(extension) {
+  return safeTextExtensions.has(extension) || safeArchiveExtensions.has(extension);
+}
+
+function isYamlPath(fileName) {
+  return [".yaml", ".yml"].includes(path.extname(fileName).toLowerCase());
+}
+
+function buildImportStats() {
+  return {
+    processedFiles: 0,
+    importedTemplates: 0,
+    runnableTemplates: 0,
+    metadataOnlyTemplates: 0,
+    blockedFiles: 0,
+    unsupportedFiles: 0,
+    totalRejectedFiles: 0,
+    filesByType: {},
+    templatesByFormat: {},
+    templatesBySourceType: {},
+    templatesByFamily: {},
+    blocked: [],
+    unsupported: []
+  };
+}
+
+function bumpCounter(record, key) {
+  record[key] = (record[key] || 0) + 1;
+}
+
+function bumpTemplateCounters(stats, template) {
+  stats.importedTemplates += 1;
+  if (template.runnable) {
+    stats.runnableTemplates += 1;
+  } else {
+    stats.metadataOnlyTemplates += 1;
+  }
+  bumpCounter(stats.templatesByFormat, template.importFormat || "unknown");
+  bumpCounter(stats.templatesBySourceType, template.sourceType || "unknown");
+  bumpCounter(stats.templatesByFamily, template.frameworkFamily || "generic");
+}
+
+function finalizeStats(stats, templates) {
+  for (const template of templates) {
+    bumpTemplateCounters(stats, template);
+  }
+
+  stats.totalRejectedFiles = stats.blockedFiles + stats.unsupportedFiles;
+  return stats;
+}
+
+function createTemplateRecord({
+  sourceName,
+  sourceType,
+  importFormat,
+  nucleiId,
+  name,
+  severity,
+  tags,
+  product,
+  category,
+  frameworkFamily,
+  summary,
+  references,
+  cveIds,
+  versionRange,
+  raw,
+  runnable,
+  executionMode,
+  safe
+}) {
+  const normalizedTags = unique(tags.map((item) => trimText(item)));
+  const resolvedProduct = trimText(product) || "generic";
+  const resolvedCategory = inferCategory(resolvedProduct, normalizedTags, category);
+  const resolvedFamily = inferFrameworkFamily(resolvedProduct, resolvedCategory, normalizedTags, sourceName, name);
+
+  return {
+    id: uuidv4(),
+    nucleiId: nucleiId || cveIds[0] || uuidv4(),
+    sourceName,
+    sourceType,
+    importFormat,
+    name: trimText(name) || nucleiId || sanitizeFileLabel(sourceName) || "Unnamed template",
+    severity: inferSeverity(severity, "info"),
+    tags: normalizedTags,
+    product: resolvedProduct,
+    category: resolvedCategory,
+    frameworkFamily: resolvedFamily,
+    classificationLabel: `${resolvedFamily} / ${resolvedCategory} / ${resolvedProduct}`,
+    safe: Boolean(safe),
+    runnable: Boolean(runnable && raw),
+    executionMode: executionMode || "metadata",
+    metadataOnly: !(runnable && raw),
+    cveIds,
+    references,
+    versionRange: trimText(versionRange),
+    summary: trimText(summary),
+    raw: runnable && raw ? raw : null
+  };
+}
+
+export function isLikelyNucleiTemplate(doc) {
+  if (!doc || typeof doc !== "object" || Array.isArray(doc)) {
+    return false;
+  }
+
+  const hasInfoSection = Boolean(doc.info && typeof doc.info === "object");
+  const hasIdentity = Boolean(doc.id || doc.info?.name);
+  const hasExecutionSection = [...safeNucleiSections, ...dangerousNucleiSections].some(
+    (key) => Array.isArray(doc[key]) || typeof doc[key] === "object"
+  );
+
+  return hasInfoSection && hasIdentity && hasExecutionSection;
+}
+
+function getNucleiExecutionMode(doc) {
+  for (const key of safeNucleiSections) {
+    if (Array.isArray(doc[key]) || typeof doc[key] === "object") {
+      return key;
+    }
+  }
+
+  for (const key of dangerousNucleiSections) {
+    if (Array.isArray(doc[key]) || typeof doc[key] === "object") {
+      return key;
+    }
+  }
+
+  return "metadata";
+}
+
+function hasDangerousNucleiSections(doc) {
+  return dangerousNucleiSections.some((key) => Array.isArray(doc[key]) || typeof doc[key] === "object");
+}
+
+function extractTemplate(doc, sourceName, importFormat) {
+  const info = doc.info ?? {};
+  const metadata = info.metadata ?? {};
+  const tags = unique([...toArray(info.tags), ...toArray(metadata.tags)]);
+  const textSignals = [
+    sourceName,
+    doc.id,
+    info.name,
+    info.description,
+    metadata.product,
+    metadata.vendor
+  ]
+    .filter(Boolean)
+    .join(" ");
+  const product = metadata.product ?? metadata.vendor ?? inferProductFromSignals(textSignals, tags);
+  const dangerous = hasDangerousNucleiSections(doc);
+  const executionMode = getNucleiExecutionMode(doc);
+  const references = unique([...(Array.isArray(info.reference) ? info.reference : []), ...extractReferences(textSignals)]);
+  const summary = trimText(info.description || metadata.description || "");
+
+  return createTemplateRecord({
+    sourceName,
+    sourceType: "nuclei",
+    importFormat,
+    nucleiId: doc.id,
+    name: info.name ?? doc.id ?? sourceName,
+    severity: info.severity ?? metadata.severity ?? "info",
+    tags,
+    product,
+    category: metadata.category ?? tags[1] ?? "uncategorized",
+    summary,
+    references,
+    cveIds: extractCveIds(`${doc.id ?? ""} ${info.name ?? ""} ${summary}`),
+    versionRange: metadata.affected_version || metadata.version || metadata.version_range || "",
+    raw: dangerous ? null : doc,
+    runnable: !dangerous,
+    executionMode,
+    safe: !dangerous
+  });
+}
+
+function buildMetadataTemplate(sourceName, importFormat, text, fallback = {}) {
+  const cleanText = `${text ?? ""}`.trim();
+  const cveIds = extractCveIds(cleanText);
+  const references = extractReferences(cleanText);
+  const name =
+    trimText(fallback.name) ||
+    cveIds[0] ||
+    sanitizeFileLabel(sourceName) ||
+    "Metadata template";
+  const tags = unique([
+    ...toArray(fallback.tags),
+    ...cveIds,
+    fallback.product,
+    fallback.category,
+    fallback.frameworkFamily
+  ]);
+  const product = trimText(fallback.product) || inferProductFromSignals(sourceName, cleanText, tags);
+  const summary =
+    trimText(fallback.summary) ||
+    trimText(cleanText.split(/\r?\n/).find((line) => trimText(line))) ||
+    `${name} metadata record`;
+
+  return createTemplateRecord({
+    sourceName,
+    sourceType: fallback.sourceType || "custom-metadata",
+    importFormat,
+    nucleiId: fallback.nucleiId || cveIds[0] || "",
+    name,
+    severity: fallback.severity || inferSeverity(cleanText, "info"),
+    tags,
+    product,
+    category: fallback.category || "uncategorized",
+    frameworkFamily: fallback.frameworkFamily || "",
+    summary,
+    references,
+    cveIds,
+    versionRange: fallback.versionRange || "",
+    raw: null,
+    runnable: false,
+    executionMode: "metadata",
+    safe: true
+  });
+}
+
+function parseJsonMetadata(sourceName, extension, content) {
+  const parsed = JSON.parse(stripBom(content));
+  const items = Array.isArray(parsed) ? parsed : [parsed];
+  const templates = [];
+
+  for (const item of items) {
+    if (isLikelyNucleiTemplate(item)) {
+      templates.push(extractTemplate(item, sourceName, extension.slice(1)));
+      continue;
+    }
+
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+
+    const mergedText = JSON.stringify(item, null, 2);
+    templates.push(
+      buildMetadataTemplate(sourceName, extension.slice(1), mergedText, {
+        sourceType: "advisory",
+        nucleiId: item.id || item.cve || item.cveId || "",
+        name: item.title || item.name || item.vulnerability || "",
+        severity: item.severity || item.level || "",
+        tags: item.tags || item.keywords || [],
+        product: item.product || item.vendor || item.framework || "",
+        category: item.category || item.family || "",
+        frameworkFamily: item.frameworkFamily || item.family || "",
+        summary: item.description || item.summary || item.note || "",
+        versionRange: item.versionRange || item.affectedVersions || item.affected || ""
+      })
+    );
+  }
+
+  return templates;
+}
+
+function parseYamlMetadata(sourceName, extension, content) {
+  const docs = YAML.parseAllDocuments(stripBom(content))
+    .map((doc) => doc.toJSON())
+    .filter((doc) => doc !== null && doc !== undefined);
+  const templates = [];
+
+  for (const doc of docs) {
+    if (isLikelyNucleiTemplate(doc)) {
+      templates.push(extractTemplate(doc, sourceName, extension.slice(1)));
+      continue;
+    }
+
+    if (!doc || typeof doc !== "object" || Array.isArray(doc)) {
+      continue;
+    }
+
+    templates.push(
+      buildMetadataTemplate(sourceName, extension.slice(1), YAML.stringify(doc), {
+        sourceType: "advisory",
+        nucleiId: doc.id || doc.cve || "",
+        name: doc.title || doc.name || "",
+        severity: doc.severity || "",
+        tags: doc.tags || [],
+        product: doc.product || doc.vendor || "",
+        category: doc.category || doc.family || "",
+        frameworkFamily: doc.frameworkFamily || "",
+        summary: doc.description || doc.summary || "",
+        versionRange: doc.versionRange || doc.affected || ""
+      })
+    );
+  }
+
+  return templates;
+}
+
+function parseTextMetadata(sourceName, extension, content) {
+  return [buildMetadataTemplate(sourceName, extension.slice(1), stripBom(content), { sourceType: "advisory" })];
+}
+
+function importTextDocument(sourceName, extension, content, stats) {
+  stats.processedFiles += 1;
+  bumpCounter(stats.filesByType, extension.slice(1) || "unknown");
+
+  try {
+    if (extension === ".json") {
+      return parseJsonMetadata(sourceName, extension, content);
+    }
+
+    if (extension === ".yaml" || extension === ".yml") {
+      return parseYamlMetadata(sourceName, extension, content);
+    }
+
+    return parseTextMetadata(sourceName, extension, content);
+  } catch (error) {
+    stats.unsupportedFiles += 1;
+    stats.unsupported.push({ sourceName, reason: error.message });
+    return [];
+  }
+}
+
+function collectDirectoryFiles(rootDir, relativeDir = "") {
+  const currentDir = path.join(rootDir, relativeDir);
+  const entries = fs.readdirSync(currentDir, { withFileTypes: true });
+  const results = [];
+
+  for (const entry of entries) {
+    const nextRelativePath = path.join(relativeDir, entry.name);
+    if (entry.isDirectory()) {
+      results.push(...collectDirectoryFiles(rootDir, nextRelativePath));
+      continue;
+    }
+
+    results.push(nextRelativePath);
+  }
+
+  return results;
+}
+
+function importZipEntries(sourceName, buffer, stats) {
+  const zip = new AdmZip(buffer);
+  const imported = [];
+
+  for (const entry of zip.getEntries()) {
+    if (entry.isDirectory) {
+      continue;
+    }
+
+    const extension = path.extname(entry.entryName).toLowerCase();
+    const nestedSourceName = `${sourceName}:${entry.entryName}`;
+
+    if (blockedExtensions.has(extension)) {
+      stats.blockedFiles += 1;
+      stats.blocked.push({ sourceName: nestedSourceName, reason: "blocked executable or script type" });
+      continue;
+    }
+
+    if (!isSupportedExtension(extension)) {
+      stats.unsupportedFiles += 1;
+      stats.unsupported.push({ sourceName: nestedSourceName, reason: "unsupported file type" });
+      continue;
+    }
+
+    if (safeArchiveExtensions.has(extension)) {
+      imported.push(...importZipEntries(nestedSourceName, entry.getData(), stats));
+      continue;
+    }
+
+    imported.push(...importTextDocument(nestedSourceName, extension, entry.getData().toString("utf8"), stats));
+  }
+
+  return imported;
+}
+
+export function importTemplateSourceFromPath(importPath) {
+  const absolutePath = path.resolve(importPath);
+  const stats = buildImportStats();
+  let imported = [];
+
+  if (fs.statSync(absolutePath).isDirectory()) {
+    const files = collectDirectoryFiles(absolutePath);
+    for (const relativePath of files) {
+      const absoluteFilePath = path.join(absolutePath, relativePath);
+      const extension = path.extname(relativePath).toLowerCase();
+      const sourceName = `${path.basename(absolutePath)}:${relativePath}`;
+
+      if (blockedExtensions.has(extension)) {
+        stats.blockedFiles += 1;
+        stats.blocked.push({ sourceName, reason: "blocked executable or script type" });
+        continue;
+      }
+
+      if (!isSupportedExtension(extension)) {
+        stats.unsupportedFiles += 1;
+        stats.unsupported.push({ sourceName, reason: "unsupported file type" });
+        continue;
+      }
+
+      if (safeArchiveExtensions.has(extension)) {
+        imported.push(...importZipEntries(sourceName, fs.readFileSync(absoluteFilePath), stats));
+        continue;
+      }
+
+      imported.push(...importTextDocument(sourceName, extension, fs.readFileSync(absoluteFilePath, "utf8"), stats));
+    }
+  } else {
+    const extension = path.extname(absolutePath).toLowerCase();
+    const sourceName = path.basename(absolutePath);
+
+    if (blockedExtensions.has(extension)) {
+      stats.blockedFiles += 1;
+      stats.blocked.push({ sourceName, reason: "blocked executable or script type" });
+    } else if (safeArchiveExtensions.has(extension)) {
+      imported = importZipEntries(sourceName, fs.readFileSync(absolutePath), stats);
+    } else if (safeTextExtensions.has(extension)) {
+      imported = importTextDocument(sourceName, extension, fs.readFileSync(absolutePath, "utf8"), stats);
+    } else {
+      stats.unsupportedFiles += 1;
+      stats.unsupported.push({ sourceName, reason: "unsupported file type" });
+    }
+  }
+
+  const templates = dedupeTemplates(imported);
+  return {
+    templates,
+    stats: finalizeStats(stats, templates)
+  };
+}
+
+export function importTemplateUploads(files = [], inlineText = "", inlineSourceName = "inline.yaml") {
+  const stats = buildImportStats();
+  const imported = [];
+
+  for (const file of files) {
+    const extension = path.extname(file.originalname).toLowerCase();
+
+    if (blockedExtensions.has(extension)) {
+      stats.blockedFiles += 1;
+      stats.blocked.push({ sourceName: file.originalname, reason: "blocked executable or script type" });
+      continue;
+    }
+
+    if (safeArchiveExtensions.has(extension)) {
+      imported.push(...importZipEntries(file.originalname, file.buffer, stats));
+      continue;
+    }
+
+    if (!safeTextExtensions.has(extension)) {
+      stats.unsupportedFiles += 1;
+      stats.unsupported.push({ sourceName: file.originalname, reason: "unsupported file type" });
+      continue;
+    }
+
+    imported.push(...importTextDocument(file.originalname, extension, file.buffer.toString("utf8"), stats));
+  }
+
+  if (inlineText?.trim()) {
+    imported.push(...importTextDocument(inlineSourceName, path.extname(inlineSourceName).toLowerCase() || ".yaml", inlineText, stats));
+  }
+
+  const templates = dedupeTemplates(imported);
+  return {
+    templates,
+    stats: finalizeStats(stats, templates)
+  };
+}
+
+export function parseTemplateDocuments(sourceName, content) {
+  const extension = path.extname(sourceName).toLowerCase() || ".yaml";
+  return dedupeTemplates(importTextDocument(sourceName, extension, content, buildImportStats()));
+}
+
+export function parseZipTemplateBuffer(sourceName, buffer) {
+  return dedupeTemplates(importZipEntries(sourceName, buffer, buildImportStats()));
+}
+
+export function parseTemplateDirectory(sourceName, directoryPath) {
+  const imported = [];
+  const files = collectDirectoryFiles(directoryPath).filter((relativePath) => isYamlPath(relativePath));
+
+  for (const relativePath of files) {
+    const absolutePath = path.join(directoryPath, relativePath);
+    const content = fs.readFileSync(absolutePath, "utf8");
+    imported.push(...parseTemplateDocuments(`${sourceName}:${relativePath}`, content));
+  }
+
+  return dedupeTemplates(imported);
+}
+
+export function summarizeTemplateGroups(templates) {
+  const groups = {};
+
+  for (const template of templates) {
+    const key = template.frameworkFamily || "generic";
+    if (!groups[key]) {
+      groups[key] = {
+        frameworkFamily: key,
+        count: 0,
+        runnable: 0,
+        metadataOnly: 0,
+        categories: new Set(),
+        products: new Set(),
+        sourceTypes: new Set()
+      };
+    }
+
+    groups[key].count += 1;
+    groups[key].runnable += template.runnable ? 1 : 0;
+    groups[key].metadataOnly += template.runnable ? 0 : 1;
+    groups[key].categories.add(template.category);
+    groups[key].products.add(template.product);
+    groups[key].sourceTypes.add(template.sourceType || "unknown");
+  }
+
+  return Object.values(groups)
+    .map((group) => ({
+      frameworkFamily: group.frameworkFamily,
+      count: group.count,
+      runnable: group.runnable,
+      metadataOnly: group.metadataOnly,
+      categories: [...group.categories].sort(),
+      products: [...group.products].sort().slice(0, 10),
+      sourceTypes: [...group.sourceTypes].sort()
+    }))
+    .sort((left, right) => right.count - left.count);
+}
+
+export function mergeImportedTemplates(existingTemplates, importedTemplates) {
+  const seen = new Set(existingTemplates.map((template) => buildTemplateIdentity(template)));
+  const uniqueImported = [];
+
+  for (const template of dedupeTemplates(importedTemplates)) {
+    const key = buildTemplateIdentity(template);
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    uniqueImported.push(template);
+  }
+
+  return uniqueImported;
+}
+
+
+
+function inferFrameworkFamilyPoc(product, category, tags, sourceName, name) {
+  const signals = [product, category, sourceName, name, ...tags].map(normalize).filter(Boolean);
+
+  for (const family of allFamilies) {
+    if (family.products.some((productName) => signals.some((signal) => signal.includes(productName)))) {
+      return family.name;
+    }
+  }
+
+  if (signals.some((signal) => signal.includes("cms"))) {
+    return "cms";
+  }
+  if (signals.some((signal) => signal.includes("oa") || signal.includes("erp"))) {
+    return "enterprise-app";
+  }
+  return "generic";
+}
+
+function inferProductFromPocSignals(...signals) {
+  const flattened = signals
+    .flatMap((value) => (Array.isArray(value) ? value : [value]))
+    .map(normalize)
+    .filter(Boolean);
+
+  for (const family of allFamilies) {
+    for (const product of family.products) {
+      if (flattened.some((signal) => signal.includes(product))) {
+        return product;
+      }
+    }
+  }
+  return "generic";
+}
+
+// Infer category from POC directory name when README is empty
+function inferPocCategoryFromDirName(dirName) {
+  const normalized = normalize(dirName);
+  if (/container[-_]escape|docker[-_]escape|container[-_]breakout/.test(normalized)) return "container-escape";
+  if (/privilege[-_]escalat|lpe|impersonat/.test(normalized)) return "privilege-escalation";
+  if (/rce|remote[-_]code|command[-_]inject/.test(normalized)) return "remote-code-execution";
+  if (/uaf|use[-_]after|memory[-_]corrupt|oob|buffer[-_]overflow/.test(normalized)) return "memory-corruption";
+  if (/motw|mark[-_]of[-_]the[-_]web|defense[-_]bypass|ads|stream/.test(normalized)) return "defense-bypass";
+  if (/xss|ssrf|sqli|injection/.test(normalized)) return "injection";
+  if (/crash|dos|denial/.test(normalized)) return "denial-of-service";
+  return "uncategorized";
+}
+
+// Parse README.md content to extract vulnerability metadata
+function parsePocReadme(readmeText, pocDirName) {
+  if (!readmeText?.trim()) {
+    return {
+      name: sanitizeFileLabel(pocDirName),
+      severity: "high",
+      product: inferProductFromPocSignals(pocDirName),
+      category: inferPocCategoryFromDirName(pocDirName),
+      summary: `POC from ${pocDirName}`,
+      cveIds: [],
+      versionRange: "",
+      frameworkFamily: inferFrameworkFamilyPoc("", inferPocCategoryFromDirName(pocDirName), [], "", pocDirName)
+    };
+  }
+
+  const text = `${readmeText}`;
+
+  // Skip files that are repository-level READMEs (not a POC description)
+  // A POC README typically starts with a product-specific heading
+  const firstHeadingMatch = text.match(/^#\s+(.+)$/m);
+  const firstHeading = firstHeadingMatch ? trimText(firstHeadingMatch[1]) : sanitizeFileLabel(pocDirName);
+
+  // Detect if this is a repo-level README, not a POC-specific one
+  const repositoryKeywords = /statement|contents|consolidation|news|contact|abuse/;
+  const secondHeading = text.match(/^##\s+(.+)$/m);
+  const isRepoReadme = firstHeading.toLowerCase().includes("exploitarium") ||
+    (secondHeading && repositoryKeywords.test(secondHeading[1].toLowerCase()));
+
+  if (isRepoReadme) {
+    return null; // Skip repo-level README
+  }
+
+  // Extract CVE IDs
+  const cveIds = extractCveIds(text);
+  const cveBlockMatch = text.match(/CVE[:\s-]+([\s\S]*?)(?:\n\n|$)/i);
+  const cveBlockIds = cveBlockMatch ? cveBlockMatch[1].match(/CVE-\d{4}-\d{4,8}/gi)?.map((item) => item.toUpperCase()) ?? [] : [];
+
+  // Extract severity from keywords
+  let severity = "high";
+  const combined = `${firstHeading} ${text.slice(0, 2000)}`.toLowerCase();
+  if (/critical|rce|remote code execution|command injection|arbitrary code/.test(combined)) {
+    severity = "critical";
+  } else if (/high|privilege escalation|local system|nt authority|lpe/.test(combined)) {
+    severity = "high";
+  } else if (/medium|moderate|information disclosure|crash|dos/.test(combined)) {
+    severity = "medium";
+  } else if (/low|notice/.test(combined)) {
+    severity = "low";
+  }
+
+  // Extract affected version / target -   // Extract affected version / target - try multiple patterns
+  let versionRange = "";
+  let vm = text.match(/(?:version|release)\s*(?:analyzed|observed|tested|target)?[:\s]*([\d.]+(?:\s*[-–]\s*[\d.]+)?)/i);
+  // Table row with backtick version like "| c-ares latest official release `v1.34.6` |"
+  if (!vm) vm = text.match(/`v?([\d.]+)`\s*\|/im);
+  // "7-Zip 26.01 x64" pattern
+  if (!vm) vm = text.match(/(?:7-Zip\s+)([\d.]+)/i);
+  // "latest official release ... v1.34.6"
+  if (!vm) vm = text.match(/latest official release.*?v([\d.]+)/im);
+  // "Affected Target" or "Product Version" heading
+  if (!vm) vm = text.match(/(?:Affected\s+)?(?:Target|Product|Version)[:\s]*([^\n]{3,80})/i);
+  // "for Windows 9.7.6" pattern
+  if (!vm) vm = text.match(/(?:for\s+(?:Windows|Linux|macOS)\s+)([\d.]+)/i);
+  if (vm) {
+    versionRange = trimText(vm[1] || "");
+    versionRange = versionRange.replace(/^[-–|•]\s*/, "").replace(/\s*[-–|•]\s*$/, "");
+  }
+  let category = "uncategorized";
+  const catText = text.slice(0, 3000).toLowerCase();
+
+  // Determine CWE/category from keywords
+  if (/use-after-free|uaf|heap|memory corruption|buffer overflow|oob/.test(catText)) {
+    category = "memory-corruption";
+  } else if (/impersonation|com|privilege|elevation|lpe|nt authority/.test(catText)) {
+    category = "privilege-escalation";
+  } else if (/rce|remote code|command injection|arbitrary code execution/.test(catText)) {
+    category = "remote-code-execution";
+  } else if (/mark.of.the.web|motw|zone.identifier|ads|alternate data stream/.test(catText)) {
+    category = "defense-bypass";
+  } else if (/container escape|docker escape|container breakout/.test(catText)) {
+    category = "container-escape";
+  } else if (/xss|ssrf|sqli|injection/.test(catText)) {
+    category = "injection";
+  } else if (/crash|dos|denial/.test(catText)) {
+    category = "denial-of-service";
+  }
+
+  // Extract product from heading and text
+  const product = inferProductFromPocSignals(firstHeading, pocDirName, text.slice(0, 1000));
+
+  // Extract tags from keywords
+  const keywordMap = [
+    ["rce", "remote-code-execution"],
+    ["lpe", "privilege-escalation"],
+    ["uaf", "use-after-free"],
+    ["motw", "mark-of-the-web"],
+    ["com", "com-impersonation"],
+    ["container", "container-escape"],
+    ["ntfs", "alternate-data-stream"],
+    ["windows", "windows"],
+    ["linux", "linux"]
+  ];
+  const tags = [];
+  for (const [kw, tag] of keywordMap) {
+    if (combined.includes(kw)) tags.push(tag);
+  }
+
+  // Extract references
+  const references = extractReferences(text);
+
+  // Extract summary from first non-heading paragraph or description
+  let summary = "";
+  const descMatch = text.match(/^##\s*(?:Description|Summary|Overview|Vulnerability|Impact)[\s\S]*?\n\n([\s\S]{0,800}?)(?:\n##|\n\n##|$)/im);
+  if (descMatch) {
+    summary = trimText(descMatch[1].replace(/#{1,4}\s/g, ""));
+  }
+  if (!summary) {
+    const firstParagraphs = text
+      .replace(/^#.*$/gm, "")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim()
+      .split(/\n\n/)
+      .filter((p) => trimText(p).length > 40);
+    summary = trimText(firstParagraphs[0] || "");
+  }
+  if (!summary) {
+    summary = firstHeading;
+  }
+
+  const frameworkFamily = inferFrameworkFamilyPoc(product, category, tags, pocDirName, firstHeading);
+
+  return {
+    name: firstHeading,
+    severity,
+    product,
+    category,
+    frameworkFamily,
+    summary: summary.slice(0, 500),
+    cveIds: unique([...cveIds, ...cveBlockIds]),
+    tags: unique([...tags, ...extractCveIds(text).map((cve) => cve.toLowerCase())]),
+    references,
+    versionRange
+  };
+}
+
+// Create POC template records from parsed data
+function buildPocTemplateRecord(pocDirName, metadata, codeFiles, readmeRaw) {
+  return {
+    id: uuidv4(),
+    nucleiId: metadata.cveIds[0] || `poc:${pocDirName}`,
+    sourceName: pocDirName,
+    sourceType: "poc",
+    importFormat: "poc-package",
+    name: metadata.name || pocDirName,
+    severity: metadata.severity || "high",
+    tags: metadata.tags || [],
+    product: metadata.product || "generic",
+    category: metadata.category || "uncategorized",
+    frameworkFamily: metadata.frameworkFamily || "generic",
+    classificationLabel: `${metadata.frameworkFamily || "generic"} / ${metadata.category || "uncategorized"} / ${metadata.product || "generic"}`,
+    safe: true,
+    runnable: false,
+    executionMode: "metadata",
+    metadataOnly: true,
+    cveIds: metadata.cveIds || [],
+    references: metadata.references || [],
+    versionRange: metadata.versionRange || "",
+    summary: metadata.summary || `POC: ${metadata.name || pocDirName}`,
+    raw: codeFiles?.length ? {
+      type: "poc-package",
+      description: `${pocDirName} POC package containing ${codeFiles.length} file(s)`,
+      files: codeFiles.map((f) => ({
+        relativePath: f.relativePath,
+        extension: f.extension,
+        sizeBytes: f.size
+      })),
+      readme: readmeRaw || ""
+    } : null
+  };
+}
+
+// Recursively collect all files from a directory, excluding .git
+function collectAllFiles(rootDir, relativeDir = "") {
+  const currentDir = path.join(rootDir, relativeDir);
+  const entries = fs.readdirSync(currentDir, { withFileTypes: true });
+  const results = [];
+
+  for (const entry of entries) {
+    if (entry.name === ".git") continue;
+    const nextRelativePath = path.join(relativeDir, entry.name);
+    if (entry.isDirectory()) {
+      results.push(...collectAllFiles(rootDir, nextRelativePath));
+      continue;
+    }
+    results.push({
+      relativePath: nextRelativePath,
+      absolutePath: path.join(rootDir, nextRelativePath),
+      extension: path.extname(entry.name).toLowerCase(),
+      name: entry.name,
+      size: fs.statSync(path.join(rootDir, nextRelativePath)).size
+    });
+  }
+  return results;
+}
+
+// Group files by POC subdirectory
+function groupFilesByPoc(pocRootDir) {
+  const allFiles = collectAllFiles(pocRootDir);
+  const groups = {};
+
+  for (const file of allFiles) {
+    const parts = file.relativePath.split(path.sep);
+    const topDir = parts.length > 1 ? parts[0] : "_root";
+    if (!groups[topDir]) {
+      groups[topDir] = [];
+    }
+    groups[topDir].push(file);
+  }
+  return groups;
+}
+
+// Import POC package from a directory path
+export function importPocPackageFromPath(importPath) {
+  const absolutePath = path.resolve(importPath);
+  const stats = buildImportStats();
+  const templates = [];
+
+  if (!fs.existsSync(absolutePath)) {
+    return { templates: [], stats };
+  }
+
+  const isDir = fs.statSync(absolutePath).isDirectory();
+  let pocRootDir = absolutePath;
+  let topDirName = path.basename(absolutePath);
+
+  // If it's a single zip, extract and process
+  if (!isDir) {
+    const extension = path.extname(absolutePath).toLowerCase();
+    if (extension === ".zip") {
+      // Extract to temp and recurse (use /tmp since the zip source dir may be read-only)
+      try {
+        const zip = new AdmZip(absolutePath);
+        const tempDir = path.join(os.tmpdir(), `.poc-temp-${uuidv4()}`);
+        fs.mkdirSync(tempDir, { recursive: true });
+        zip.extractAllTo(tempDir, true);
+        const result = importPocPackageFromPath(tempDir);
+        fs.rmSync(tempDir, { recursive: true, force: true });
+        return result;
+      } catch (err) {
+        stats.unsupportedFiles += 1;
+        stats.unsupported.push({ sourceName: path.basename(absolutePath), reason: `zip extraction failed: ${err.message}` });
+        return { templates, stats: finalizeStats(stats, templates) };
+      }
+    }
+    stats.unsupportedFiles += 1;
+    return { templates, stats: finalizeStats(stats, templates) };
+  }
+
+  // Check if we should go into a subdirectory (common pattern: exploitarium-main)
+  const directChildren = fs.readdirSync(absolutePath, { withFileTypes: true });
+  const readmeFiles = directChildren.filter((e) => e.isFile() && e.name.toLowerCase() === "readme.md");
+  const subDirs = directChildren.filter((e) => e.isDirectory() && !e.name.startsWith("."));
+  const hasPocDirs = subDirs.length > 0;
+
+  // If there's a single subdir containing POC dirs, enter it
+  if (!readmeFiles.length && subDirs.length <= 3 && hasPocDirs) {
+    for (const sub of subDirs) {
+      const subPath = path.join(absolutePath, sub.name);
+      const innerEntries = fs.readdirSync(subPath, { withFileTypes: true });
+      const innerPocDirs = innerEntries.filter((e) => e.isDirectory() && e.name !== ".git");
+      if (innerPocDirs.length >= 2) {
+        pocRootDir = subPath;
+        topDirName = sub.name;
+        break;
+      }
+    }
+  }
+
+  // Group files by POC subdirectory
+  const pocGroups = groupFilesByPoc(pocRootDir);
+
+  for (const [pocDirName, files] of Object.entries(pocGroups)) {
+    if (pocDirName.startsWith(".")) continue;
+    if (pocDirName === "_root") continue;
+
+    stats.processedFiles += files.length;
+    bumpCounter(stats.filesByType, "poc-dir");
+
+    // Find README
+    const readmeFile = files.find((f) => f.name.toLowerCase() === "readme.md");
+    let readmeContent = "";
+    if (readmeFile) {
+      try {
+        readmeContent = fs.readFileSync(readmeFile.absolutePath, "utf8");
+      } catch {
+        readmeContent = "";
+      }
+    }
+
+    // Parse README for metadata (returns null for repo-level READMEs)
+    const metadata = parsePocReadme(readmeContent, pocDirName);
+    if (!metadata) continue;
+
+    // Collect code files (non-readme, non-gitignore, non-.gitattributes)
+    const codeFiles = files.filter((f) =>
+      !f.name.startsWith(".") &&
+      f.name.toLowerCase() !== "readme.md" &&
+      f.name.toLowerCase() !== "cves.md" &&
+      f.name !== ".gitattributes"
+    );
+
+    // Build template record
+    const template = buildPocTemplateRecord(pocDirName, metadata, codeFiles, readmeContent);
+    templates.push(template);
+  }
+
+  // Also process root-level CVES.md and README.md for global CVE references
+  const rootFiles = directChildren.filter((e) => e.isFile());
+  for (const rootFile of rootFiles) {
+    if (rootFile.name.toLowerCase() === "cves.md") {
+      try {
+        const cvesContent = fs.readFileSync(path.join(absolutePath, rootFile.name), "utf8");
+        const rootCves = extractCveIds(cvesContent);
+        // Add root-level CVE index as a metadata template
+        if (rootCves.length > 0) {
+          templates.push({
+            id: uuidv4(),
+            nucleiId: rootCves[0],
+            sourceName: "exploitarium:cves-index",
+            sourceType: "poc-index",
+            importFormat: "poc-package",
+            name: "Exploitarium CVE Index",
+            severity: "info",
+            tags: ["index", "exploitarium", ...rootCves],
+            product: "generic",
+            category: "vulnerability-index",
+            frameworkFamily: "generic",
+            classificationLabel: "generic / vulnerability-index / generic",
+            safe: true,
+            runnable: false,
+            executionMode: "metadata",
+            metadataOnly: true,
+            cveIds: rootCves,
+            references: [],
+            versionRange: "",
+            summary: `Index of ${rootCves.length} CVEs from Exploitarium repository. ${cvesContent.slice(0, 200)}`,
+            raw: null
+          });
+        }
+      } catch { /* skip */ }
+    }
+  }
+
+  const deduped = dedupeTemplates(templates);
+  return {
+    templates: deduped,
+    stats: finalizeStats(stats, deduped)
+  };
+}
+
+
+export function filterValidTemplateRecords(templates) {
+  return templates.filter((template) => template.safe && (template.runnable ? isLikelyNucleiTemplate(template.raw) : true));
+}
+
+export function loadSampleTemplates() {
+  if (!fs.existsSync(sampleTemplatePath)) {
+    return [];
+  }
+
+  const content = fs.readFileSync(sampleTemplatePath, "utf8");
+  return parseTemplateDocuments(path.basename(sampleTemplatePath), content);
+}
