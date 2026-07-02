@@ -4,7 +4,7 @@
 import { v4 as uuidv4 } from "uuid";
 import { locateUpstreamSources } from "../lib/upstream-locator-service.js";
 import { callAiJson } from "../lib/ai-review-service.js";
-import { convertMultiPoc } from "./poc-converter.js";
+// convertMultiPoc imported via dynamic import when needed
 
 // ----- 白盒审计管线 -----
 // 1. 接收已完成扫描的资产

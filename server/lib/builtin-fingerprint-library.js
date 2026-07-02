@@ -73,7 +73,7 @@ export const builtinFingerprintRules = [
   { id: "nextjs", platform: "nextjs", category: "framework", confidence: 0.86, source: "whatweb",
     bodyPatterns: ["next","__next","__NEXT_DATA__"], minMatches: 1 },
   { id: "fastapi", platform: "fastapi", category: "framework", confidence: 0.82, source: "whatweb",
-    bodyPatterns: ["fastapi","/docs\"], urlPatterns: ["/docs","/openapi.json"], minMatches: 1 },
+    bodyPatterns: ["fastapi","/docs","/openapi.json"], urlPatterns: ["/docs","/openapi.json"], minMatches: 1 },
   { id: "ruoyi", platform: "ruoyi", category: "framework", confidence: 0.93, source: "FingerprintHub",
     titlePatterns: ["若依"], bodyPatterns: ["ruoyi","若依","/ruoyi/"], minMatches: 1 },
 
