@@ -1444,6 +1444,13 @@ Linux 默认运行方式:
 async function main() {
   const rawArgs = process.argv.slice(2);
   const parsed = resolveFlagMode(parseArgs(rawArgs));
+    // Auto-correct common typos
+  for (let i = 0; i < rawArgs.length; i++) {
+    if (rawArgs[i] === "--flie") rawArgs[i] = "--file";
+    if (rawArgs[i] === "--statuss") rawArgs[i] = "--status";
+    if (rawArgs[i] === "--importt") rawArgs[i] = "--import";
+  }
+
   const [group, ...rest] = parsed.positionals;
 
   if (!group || group === "help" || group === "--help" || group === "-h") {
