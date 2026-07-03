@@ -58,10 +58,17 @@ const PIPELINE = {
     label: "资产导入",
     agent: "asset-importer",
     action: "asset:import-file",
-    next: "fingerprint"
+    next: "recon"
   },
 
   // Stage 5: 指纹识别
+  "recon": {
+    label: "信息搜集",
+    agent: "recon-agent",
+    action: "recon:full-pipeline",
+    next: "fingerprint"
+  },
+
   "fingerprint": {
     label: "指纹识别",
     agent: "fingerprinter",
@@ -103,6 +110,7 @@ const AGENT_ROUTING = {
   "scan-executor": { capabilities: ["scan:execute", "scan:batch", "scan:strategy"], handler: "executeScan" },
   "ai-reviewer": { capabilities: ["review:single", "review:batch"], handler: "reviewBatch" },
   "kali-toolbox": { capabilities: ["tool:nmap", "tool:nikto", "tool:sqlmap", "tool:httpx", "scan:asset"] },
+  "recon-agent": { capabilities: ["recon:quick", "recon:port-scan", "recon:subdomain", "recon:deep", "recon:batch", "recon:full-pipeline"] },
   "orchestrator": { capabilities: ["merge:templates", "generate:report", "pipeline:execute", "pipeline:status"] }
 };
 
@@ -222,6 +230,10 @@ class PipelineEngine {
         return await this.handleAssetImport(input, pipeline);
       }
 
+      case "recon": {
+        return await this.handleRecon(input, pipeline);
+      }
+
       case "fingerprint": {
         return await this.handleFingerprint(input, pipeline);
       }
@@ -296,6 +308,33 @@ class PipelineEngine {
       live: uniqueImported.filter(a => a.availability?.reachable).length,
       assetIds: uniqueImported.map(a => a.id)
     };
+  }
+
+  async handleRecon(input, pipeline) {
+    // 对导入的资产进行信息搜集：端口扫描 + 子域名发现
+    const assetIds = input.assetIds || [];
+    let assets;
+
+    if (assetIds.length > 0) {
+      assets = this.state.assets.filter(a => assetIds.includes(a.id));
+    } else if (input.projectName) {
+      assets = this.state.assets.filter(a => (a.projectName || "") === input.projectName);
+    } else {
+      assets = this.state.assets;
+    }
+
+    pipeline.logs.push(`[信息搜集] Processing ${assets.length} assets`);
+
+    // 调用 recon-agent 的 fullReconPipeline
+    const { fullReconPipeline } = await import("./recon-agent.js");
+    const result = await fullReconPipeline(assets, this.state, {
+      timeout: 60000
+    });
+
+    pipeline.logs.push(`[信息搜集] Found ${result.portsScanned} open ports, ${result.subdomainsFound} subdomains`);
+    pipeline.logs.push(`[信息搜集] ${result.newAssetsDiscovered} new assets discovered (${result.aliveNewAssets} alive)`);
+
+    return result;
   }
 
   async handleFingerprint(input, pipeline) {

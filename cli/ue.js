@@ -833,11 +833,11 @@ async function commandFile(args) {
   print(tone("╠════════════════════════════════════════════╣", ansi.cyan));
   print(tone("║  请选择扫描模式:                             ║", ansi.cyan));
   print(tone("║                                            ║", ansi.cyan));
-  print(tone("║  [1] 全自动扫描 (推荐)                       ║", ansi.bold, ansi.green));
-  print(tone("║      导入→测活→指纹→扫描→AI复核→HTML报告    ║", ansi.dim));
+  print(tone("║  [1] 全自动扫描+资产扩展 (推荐)                       ║", ansi.bold, ansi.green));
+  print(tone("║      导入→测活→信息搜集→指纹→扫描→AI复核→HTML报告    ║", ansi.dim));
   print(tone("║                                            ║", ansi.cyan));
   print(tone("║  [2] 仅指纹识别                             ║", ansi.bold, ansi.yellow));
-  print(tone("║      导入→测活→AI指纹识别→指纹分布报告       ║", ansi.dim));
+  print(tone("║      导入→测活→信息搜集→AI指纹识别       ║", ansi.dim));
   print(tone("║                                            ║", ansi.cyan));
   print(tone("║  [3] 全量扫描+白盒审计复挖 (高级)             ║", ansi.bold, ansi.magenta));
   print(tone("║      扫描→AI复核→开源审计→漏洞复测           ║", ansi.dim));
@@ -920,8 +920,50 @@ async function runFullAutoScan(filePath, fileName, buffer, projectName, args) {
     return;
   }
 
-  // Phase 2: 指纹识别
-  printSection("Phase 2/5: AI指纹识别");
+  // Phase 2: 信息搜集
+  printSection("Phase 2/6: 信息搜集 (资产扩展)");
+
+  // 对存活资产进行端口扫描和子域名发现
+  const { runReconBatch } = await import("../server/agents/recon-agent.js");
+
+  showProgress("侦察中", 0, liveAssets.length, "");
+  const reconResults = await runReconBatch(liveAssets.slice(0, 20), "port-scan");
+
+  const allDiscovered = [];
+  let totalPorts = 0;
+  let totalSubdomains = 0;
+
+  for (const rr of reconResults.results) {
+    totalPorts += rr.openPorts?.length || 0;
+    totalSubdomains += rr.subdomains?.length || 0;
+    for (const disco of (rr.discoveredAssets || [])) {
+      allDiscovered.push({
+        target: disco.target,
+        type: disco.type,
+        subdomain: disco.subdomain,
+        port: disco.port,
+        service: disco.service,
+        confidence: disco.confidence
+      });
+    }
+  }
+
+  endProgress();
+
+  // 去重并合并新发现资产
+  const { mergeDiscoveredAssets } = await import("../server/agents/recon-agent.js");
+  const newAssets = mergeDiscoveredAssets(state.assets, allDiscovered);
+  state.assets.unshift(...newAssets);
+  persist();
+
+  const aliveNew = newAssets.filter(a => a.status === "new");
+  printKeyValue("端口发现", `${totalPorts}`, ansi.bold);
+  printKeyValue("子域名", `${totalSubdomains}`, ansi.bold);
+  printKeyValue("新增资产", `${newAssets.length}`, ansi.green);
+  print("");
+
+  // Phase 3: 指纹识别
+  printSection("Phase 2/6: 信息搜集");
 
   let fpDone = 0;
   for (const asset of liveAssets) {
@@ -950,7 +992,7 @@ async function runFullAutoScan(filePath, fileName, buffer, projectName, args) {
   print("");
 
   // Phase 3: 扫描
-  printSection("Phase 3/5: 漏洞扫描");
+  printSection("Phase 4/6: 漏洞扫描");
   
   const scanTask = createQueuedTask(state, {
     name: `AutoScan-${projectName}`,
@@ -974,7 +1016,7 @@ async function runFullAutoScan(filePath, fileName, buffer, projectName, args) {
   print("");
 
   // Phase 4: AI复核
-  printSection("Phase 4/5: AI复核");
+  printSection("Phase 5/6: AI复核");
   if (state.settings.ai.enabled && totalFindings > 0) {
     showProgress("复核中", 0, totalFindings, "");
     let reviewed = 0;
@@ -993,7 +1035,7 @@ async function runFullAutoScan(filePath, fileName, buffer, projectName, args) {
   print("");
 
   // Phase 5: 生成 HTML 报告
-  printSection("Phase 5/5: 生成HTML报告");
+  printSection("Phase 6/6: 生成HTML报告");
   await generateHtmlReport(projectName, scanResult, state, fileName);
   print("");
 
